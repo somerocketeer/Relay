@@ -18,7 +18,6 @@ LOG_PATH=$("$BIN/relay" events init)
 [ ! -s "$LOG_PATH" ] || { echo "FAIL: events clear did not truncate log" >&2; exit 1; }
 
 # emit an event and check the line format
-ts=$(date +%s 2>/dev/null || echo 0)
 "$BIN/relay" events emit e2e "status=ok"
 last_line=$("$BIN/relay" events show | tail -n 1)
 # Expect: type|timestamp|message

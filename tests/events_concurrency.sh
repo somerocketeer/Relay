@@ -10,7 +10,7 @@ export RELAY_STATE_DIR="$TMPDIR/state"
 mkdir -p "$RELAY_STATE_DIR"
 
 # Initialize and clear
-log_path=$("$BIN/relay" events init)
+"$BIN/relay" events init > /dev/null
 "$BIN/relay" events clear
 
 # Burst emit
