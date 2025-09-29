@@ -1,16 +1,29 @@
 name: CI
 on:
   push:
+    branches: [main]
   pull_request:
+    branches: [main]
+
 jobs:
-  test:
+  shellcheck:
+    name: ShellCheck
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Run shellcheck (optional)
-        run: |
-          sudo apt-get update && sudo apt-get install -y shellcheck || true
-          shellcheck -S warning bin/* || true
+      - name: Run ShellCheck
+        uses: ludeeus/action-shellcheck@master
+        with:
+          severity: warning
+          scandir: './'
+          ignore_paths: '.git'
+          ignore_names: ''
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
       - name: Smoke tests
         run: |
           chmod +x bin/* tests/noreg.sh
