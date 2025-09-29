@@ -464,18 +464,28 @@ relay_tui_preview() {
 
 relay_tui_preview_kits() {
   if relay_tui_feature_enabled tmux; then
-    output=$(
-      relay_tui_run kit status 2>&1
-    ) || {
+    output=$(relay_tui_run kit status 2>&1)
+    status=$?
+    if [ $status -ne 0 ]; then
       printf '%s\n' "$output"
       printf '\n%s\n' 'Tip: ensure tmux sessions are reachable or run relay kit list.'
       return 1
-    }
-    printf '%s\n' "$output"
+    fi
+    trimmed=$(printf '%s' "$output" | tr -d '\t\r\n ')
+    if [ -z "$trimmed" ]; then
+      printf '%s\n' 'No kits found. Run relay kit edit <name> to create one.'
+    else
+      printf '%s\n' "$output"
+    fi
     return 0
   fi
   printf '%s\n\n' 'tmux missing; showing available kits.'
-  relay_tui_run kit list 2>&1
+  listing=$(relay_tui_run kit list 2>&1)
+  if [ -n "$listing" ]; then
+    printf '%s\n' "$listing"
+  else
+    printf '%s\n' 'No kits found. Run relay kit edit <name> to create one.'
+  fi
 }
 
 relay_tui_preview_personas() {
@@ -1022,7 +1032,13 @@ relay_tui_kits() {
   while :; do
     rows=$(relay_tui_kits_rows 2>/dev/null)
     if [ -z "$rows" ]; then
-      printf '%s\n' 'No kits found. Run relay kit edit <name> to create one.'
+      printf '%s\n' 'No kits found.'
+      if relay_tui_popup_confirm 'Create a new kit now?' 'This opens "relay kit edit".'; then
+        relay_tui_kits_create
+        relay_tui_kits_status_reset
+        continue
+      fi
+      printf '%s\n' 'Tip: run relay kit edit <name> to create one later.'
       return 0
     fi
     header=$(relay_tui_format_keybind_header '' \
@@ -1445,7 +1461,12 @@ relay_tui_personas() {
   while :; do
     rows=$(relay_tui_personas_rows 2>/dev/null)
     if [ -z "$rows" ]; then
-      printf '%s\n' 'No personas found. Run relay persona new to create one.'
+      printf '%s\n' 'No personas found.'
+      if relay_tui_popup_confirm 'Create a new persona now?' 'This opens "relay persona edit".'; then
+        relay_tui_personas_create
+        continue
+      fi
+      printf '%s\n' 'Tip: run relay persona new to create one later.'
       return 0
     fi
     header=$(relay_tui_format_keybind_header '' \
