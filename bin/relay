@@ -164,7 +164,13 @@ case "$CMD" in
     print_help
     ;;
   version|--version)
-    echo "relay 0.1.0"
+    # Try to get version from git tag, fallback to hardcoded
+    if command -v git >/dev/null 2>&1 && git rev-parse --git-dir >/dev/null 2>&1; then
+      version=$(git describe --tags --always --dirty 2>/dev/null || echo "0.1.0-dev")
+      echo "relay $version"
+    else
+      echo "relay 0.1.0-dev"
+    fi
     ;;
   status)
     relay_status_board
