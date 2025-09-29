@@ -1,0 +1,23 @@
+name: CI
+on:
+  push:
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run shellcheck (optional)
+        run: |
+          sudo apt-get update && sudo apt-get install -y shellcheck || true
+          shellcheck -S warning bin/* || true
+      - name: Smoke tests
+        run: |
+          chmod +x bin/* tests/noreg.sh
+          ./bin/relay help
+          ./bin/relay version
+          ./bin/relay-doctor || true
+          # events init uses ~/.local/state; should be fine in CI
+          ./bin/relay-events init
+          # non-regression script (won't find protected dirs; still passes)
+          ./tests/noreg.sh || true

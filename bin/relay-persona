@@ -1,0 +1,287 @@
+#!/usr/bin/env sh
+# relay-persona: persona management helpers
+
+SCRIPT_DIR=$(CDPATH="" cd -- "$(dirname -- "$0")" && pwd -P)
+LIB_DIR=$(CDPATH="" cd -- "$SCRIPT_DIR/.." && pwd -P)/lib
+PERSONAS_DIR=${RELAY_PERSONAS_DIR:-$HOME/.local/share/relay/personas}
+
+validate_identifier() {
+  case "$1" in
+    ''|.*|*/*|*'..'*)
+      return 1
+      ;;
+  esac
+  return 0
+}
+
+default_persona() {
+  cat <<'TOML'
+version = 1
+[env]
+# EXAMPLE_KEY = "value"
+
+[path]
+prepend = []
+append = []
+TOML
+}
+
+usage() {
+  cat <<'EOF'
+Usage: relay persona <command>
+
+Commands:
+  list|ls                      List personas
+  use|activate <name> [--apply]  Print exports (default) or apply in a subshell
+  exec <name>... -- <command>  Execute command with layered personas
+  show <name>                  Display persona configuration
+  edit <name>                  Open persona configuration in editor
+  <name>                       Shortcut for use <name>
+EOF
+}
+
+persona_dir() {
+  name="$1"
+  if ! validate_identifier "$name"; then
+    printf 'Invalid persona name: %s\n' "$name" >&2
+    exit 2
+  fi
+  printf '%s/%s\n' "$PERSONAS_DIR" "$name"
+}
+
+persona_file() {
+  printf '%s/persona.toml
+' "$(persona_dir "$1")"
+}
+
+list_personas() {
+  if [ ! -d "$PERSONAS_DIR" ]; then
+    return
+  fi
+  set -- "$PERSONAS_DIR"/*
+  if [ "$1" = "$PERSONAS_DIR/*" ]; then
+    return
+  fi
+  for persona_path in "$@"; do
+    [ -d "$persona_path" ] || continue
+    printf '%s\n' "${persona_path##*/}"
+  done | sort
+}
+
+render_exports() {
+  persona_file_path="$1"
+  if [ ! -f "$persona_file_path" ]; then
+    return 1
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "python3 is required to parse persona TOML" >&2
+    return 2
+  fi
+  PYTHONPATH="$LIB_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 - "$persona_file_path" <<'PYENV'
+import os
+import shlex
+import sys
+
+from relay_toml import TomlMissingError, load_path
+
+path = sys.argv[1]
+try:
+    data = load_path(path) or {}
+except TomlMissingError as exc:
+    print(exc, file=sys.stderr)
+    sys.exit(2)
+
+for key, value in (data.get('env') or {}).items():
+    print(f"export {key}={shlex.quote(str(value))}")
+
+path_cfg = data.get('path') or {}
+prepend = [str(x) for x in (path_cfg.get('prepend') or [])]
+append = [str(x) for x in (path_cfg.get('append') or [])]
+if prepend or append:
+    parts = prepend + ([os.environ.get('PATH', '')] if os.environ.get('PATH') else []) + append
+    merged = ':'.join(part for part in parts if part)
+    print(f"export PATH={shlex.quote(merged)}")
+PYENV
+}
+
+apply_exports() {
+  content="$1"
+  tmp=$(mktemp) || return 1
+  printf '%s
+' "$content" > "$tmp"
+  # shellcheck disable=SC1090
+  . "$tmp"
+  rm -f "$tmp"
+}
+
+pick_editor() {
+  if [ -n "${RELAY_EDITOR:-}" ]; then
+    printf '%s
+' "$RELAY_EDITOR"
+    return
+  fi
+  if [ -n "${EDITOR:-}" ]; then
+    printf '%s
+' "$EDITOR"
+    return
+  fi
+  if [ -n "${VISUAL:-}" ]; then
+    printf '%s
+' "$VISUAL"
+    return
+  fi
+  for candidate in hx helix nvim vim nano vi; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      printf '%s
+' "$candidate"
+      return
+    fi
+  done
+  printf '%s
+' 'vi'
+}
+
+open_in_editor() {
+  target="$1"
+  editor=$(pick_editor)
+  if [ -z "$editor" ]; then
+    echo "No editor configured" >&2
+    return 1
+  fi
+  # shellcheck disable=SC2086
+  set -- $editor
+  cmd="$1"
+  shift
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    printf 'Editor not found: %s
+' "$cmd" >&2
+    return 1
+  fi
+  "$cmd" "$@" "$target"
+}
+
+show_persona() {
+  persona="$1"
+  file=$(persona_file "$persona")
+  if [ ! -f "$file" ]; then
+    echo "persona.toml not found for: $persona" >&2
+    return 3
+  fi
+  if command -v bat >/dev/null 2>&1; then
+    bat --style plain --language toml "$file"
+  else
+    cat "$file"
+  fi
+}
+
+edit_persona_file() {
+  persona="$1"
+  dir=$(persona_dir "$persona")
+  file=$(persona_file "$persona")
+  mkdir -p "$dir"
+  if [ ! -f "$file" ]; then
+    default_persona > "$file"
+  fi
+  open_in_editor "$file"
+}
+
+cmd=${1:-}
+if [ $# -gt 0 ]; then
+  shift
+fi
+case "$cmd" in
+  list|ls)
+    list_personas
+    ;;
+  use|activate)
+    name=${1:-}
+    [ -n "$name" ] || { usage >&2; exit 2; }
+    shift
+    mode="print"
+    case "${1:-}" in
+      --apply|-a)
+        mode="apply"
+        shift
+        ;;
+    esac
+    persona_file_path=$(persona_file "$name")
+    exports=$(render_exports "$persona_file_path") || exit $?
+    if [ "$mode" = "apply" ]; then
+      apply_exports "$exports"
+    else
+      printf '%s
+' "$exports"
+    fi
+    ;;
+  show)
+    name=${1:-}
+    [ -n "$name" ] || { usage >&2; exit 2; }
+    show_persona "$name"
+    ;;
+  edit)
+    name=${1:-}
+    [ -n "$name" ] || { usage >&2; exit 2; }
+    edit_persona_file "$name"
+    ;;
+  exec|wrap)
+    persona_names=''
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --)
+          shift
+          break
+          ;;
+        -*)
+          printf 'Unknown option for relay persona %s: %s\n' "$cmd" "$1" >&2
+          exit 2
+          ;;
+        *)
+          if [ -z "$persona_names" ]; then
+            persona_names="$1"
+          else
+            persona_names="${persona_names}
+$1"
+          fi
+          shift
+          ;;
+      esac
+    done
+    if [ $# -eq 0 ]; then
+      echo 'Command required after --' >&2
+      exit 2
+    fi
+    if [ -n "$persona_names" ]; then
+      while IFS= read -r persona_name; do
+        [ -n "$persona_name" ] || continue
+        persona_file_path=$(persona_file "$persona_name")
+        exports=$(render_exports "$persona_file_path") || exit $?
+        [ -n "$exports" ] || continue
+        apply_exports "$exports"
+      done <<EOF
+$persona_names
+EOF
+    fi
+    exec "$@"
+    ;;
+  '')
+    usage
+    ;;
+  *)
+    name="$cmd"
+    mode="print"
+    case "${1:-}" in
+      --apply|-a)
+        mode="apply"
+        shift
+        ;;
+    esac
+    persona_file_path=$(persona_file "$name")
+    exports=$(render_exports "$persona_file_path") || exit $?
+    if [ "$mode" = "apply" ]; then
+      apply_exports "$exports"
+    else
+      printf '%s
+' "$exports"
+    fi
+    ;;
+esac

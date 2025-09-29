@@ -1,0 +1,172 @@
+#!/usr/bin/env sh
+# relay-tui: entrypoint for the fzf-powered Relay TUI
+
+SCRIPT_DIR=$(CDPATH="" cd -- "$(dirname -- "$0")" && pwd -P)
+ROOT_DIR=$(CDPATH="" cd -- "$SCRIPT_DIR/.." && pwd -P)
+LIB_DIR=$ROOT_DIR/lib
+RELAY_TUI_LIB=$LIB_DIR/relay_tui.sh
+RELAY_TUI_LIB_LOADED=0
+
+relay_tui_usage() {
+  cat <<'EOFUSAGE'
+Usage: relay-tui [command]
+
+Commands:
+  menu        Launch the main TUI menu (default)
+  kits        Open the kits panel
+  personas    Open the personas panel
+  events      Open the events panel
+  help        Show this help text
+EOFUSAGE
+}
+
+relay_tui_status_board() {
+  if [ -x "$SCRIPT_DIR/relay" ]; then
+    "$SCRIPT_DIR/relay" status
+  else
+    printf '%s\n' 'relay-tui: relay status board unavailable' >&2
+  fi
+}
+
+relay_tui_require_fzf() {
+  if command -v fzf >/dev/null 2>&1; then
+    return 0
+  fi
+  printf '%s\n' 'relay-tui: fzf not found in PATH; falling back to status board.' >&2
+  return 1
+}
+
+relay_tui_load_library() {
+  if [ "$RELAY_TUI_LIB_LOADED" = "1" ]; then
+    return 0
+  fi
+  if [ -f "$RELAY_TUI_LIB" ]; then
+    # shellcheck source=../lib/relay_tui.sh
+    . "$RELAY_TUI_LIB" || return 1
+    RELAY_TUI_LIB_LOADED=1
+    if [ -z "${RELAY_TUI_BIN_DIR:-}" ]; then
+      RELAY_TUI_BIN_DIR=$SCRIPT_DIR
+      export RELAY_TUI_BIN_DIR
+    fi
+    if [ -z "${RELAY_TUI_RELAY_BIN:-}" ]; then
+      RELAY_TUI_RELAY_BIN=$SCRIPT_DIR/relay
+      export RELAY_TUI_RELAY_BIN
+    fi
+    return 0
+  fi
+  return 1
+}
+
+relay_tui_forward() {
+  subcmd="$1"
+  shift
+  target="relay_tui_${subcmd}"
+  if ! relay_tui_init; then
+    printf '%s\n' 'relay-tui: initialization failed; showing status board.' >&2
+    relay_tui_status_board
+    return 1
+  fi
+  if command -v "$target" >/dev/null 2>&1; then
+    "$target" "$@"
+    return $?
+  fi
+  printf 'relay-tui: subcommand "%s" is unavailable; showing status board.\n' "$subcmd" >&2
+  relay_tui_status_board
+  return 0
+}
+
+relay_tui_main() {
+  cmd=${1:-menu}
+  [ $# -gt 0 ] && shift
+
+  case "$cmd" in
+    -h|--help|help)
+      relay_tui_usage
+      return 0
+      ;;
+    menu|kits|personas|events)
+      if ! relay_tui_require_fzf; then
+        relay_tui_status_board
+        return 0
+      fi
+      if ! relay_tui_load_library; then
+        printf 'relay-tui: helper library missing (%s); showing status board.\n' "$RELAY_TUI_LIB" >&2
+        relay_tui_status_board
+        return 0
+      fi
+      relay_tui_forward "$cmd" "$@"
+      return $?
+      ;;
+    preview)
+      if ! relay_tui_load_library; then
+        printf 'relay-tui: helper library missing (%s)\n' "$RELAY_TUI_LIB" >&2
+        return 127
+      fi
+      if ! relay_tui_init; then
+        printf '%s\n' 'relay-tui: initialization failed.' >&2
+        return 1
+      fi
+      relay_tui_preview "$@"
+      return $?
+      ;;
+    action)
+      if ! relay_tui_load_library; then
+        printf 'relay-tui: helper library missing (%s)\n' "$RELAY_TUI_LIB" >&2
+        return 127
+      fi
+      if ! relay_tui_init; then
+        printf '%s\n' 'relay-tui: initialization failed.' >&2
+        return 1
+      fi
+      relay_tui_action "$@"
+      return $?
+      ;;
+    kits-preview)
+      if ! relay_tui_load_library; then
+        printf 'relay-tui: helper library missing (%s)\n' "$RELAY_TUI_LIB" >&2
+        return 127
+      fi
+      if ! relay_tui_init; then
+        printf '%s\n' 'relay-tui: initialization failed.' >&2
+        return 1
+      fi
+      relay_tui_kits_preview "$@"
+      return $?
+      ;;
+    personas-preview)
+      if ! relay_tui_load_library; then
+        printf 'relay-tui: helper library missing (%s)\n' "$RELAY_TUI_LIB" >&2
+        return 127
+      fi
+      if ! relay_tui_init; then
+        printf '%s\n' 'relay-tui: initialization failed.' >&2
+        return 1
+      fi
+      relay_tui_personas_preview "$@"
+      return $?
+      ;;
+    events-preview)
+      if ! relay_tui_load_library; then
+        printf 'relay-tui: helper library missing (%s)\n' "$RELAY_TUI_LIB" >&2
+        return 127
+      fi
+      if ! relay_tui_init; then
+        printf '%s\n' 'relay-tui: initialization failed.' >&2
+        return 1
+      fi
+      relay_tui_events_detail "$@"
+      return $?
+      ;;
+    status)
+      relay_tui_status_board
+      return 0
+      ;;
+    *)
+      printf 'relay-tui: unknown command "%s"\n' "$cmd" >&2
+      relay_tui_usage >&2
+      return 2
+      ;;
+  esac
+}
+
+relay_tui_main "$@"

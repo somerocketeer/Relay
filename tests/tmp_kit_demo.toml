@@ -1,0 +1,15 @@
+version = 1
+session = 'e2e'
+dir = '/tmp/work'
+attach = false
+
+[[windows]]
+name = 'main'
+dir = '~'
+layout = 'tiled'
+[[windows.panes]]
+run = "sh -lc 'pwd > "/tmp/home_trace.txt"'"
+dir = '~'
+[[windows.panes]]
+run = "sh -lc 'pwd > "/tmp/fallback_trace.txt"'"
+dir = '~/_relay_missing_123'

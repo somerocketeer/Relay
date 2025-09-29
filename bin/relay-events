@@ -1,0 +1,72 @@
+#!/usr/bin/env sh
+# relay-events: simple append-only event log helper
+
+STATE_DIR=${RELAY_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/relay}
+LOG_FILE=${RELAY_EVENT_LOG:-$STATE_DIR/events.log}
+
+ensure_log() {
+  if [ ! -d "$STATE_DIR" ]; then
+    mkdir -p "$STATE_DIR" 2>/dev/null || return 1
+  fi
+  if [ ! -f "$LOG_FILE" ]; then
+    : > "$LOG_FILE" || return 1
+  fi
+  return 0
+}
+
+usage() {
+  cat <<'EOF'
+Usage: relay events <command>
+
+Commands:
+  emit <type> [message]   Append a line to the event log
+  tail                    Follow the event log (tail -f)
+  show                    Print the entire log once
+  clear                   Truncate the log
+  path                    Print the log location
+  init                    Ensure the log exists and print its path
+EOF
+}
+
+cmd=${1:-}
+[ $# -gt 0 ] && shift
+case "$cmd" in
+  emit)
+    type=${1:-}
+    [ -n "$type" ] || { echo "event type required" >&2; exit 2; }
+    [ $# -gt 0 ] && shift
+    message="$*"
+    ensure_log || exit 1
+    ts=$(date +%s 2>/dev/null || echo 0)
+    if [ -n "$message" ]; then
+      printf '%s|%s|%s\n' "$type" "$ts" "$message" >> "$LOG_FILE"
+    else
+      printf '%s|%s\n' "$type" "$ts" >> "$LOG_FILE"
+    fi
+    ;;
+  tail)
+    ensure_log || exit 1
+    printf '%s\n' "Press Ctrl+C to exit" >&2
+    tail -f "$LOG_FILE"
+    ;;
+  show)
+    ensure_log || exit 1
+    cat "$LOG_FILE"
+    ;;
+  clear)
+    ensure_log || exit 1
+    : > "$LOG_FILE"
+    ;;
+  path)
+    ensure_log || exit 1
+    printf '%s\n' "$LOG_FILE"
+    ;;
+  init|'')
+    ensure_log || exit 1
+    printf '%s\n' "$LOG_FILE"
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac

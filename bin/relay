@@ -1,0 +1,238 @@
+#!/usr/bin/env sh
+# Minimal dispatcher for Relay. No strict flags to stay POSIX friendly.
+
+SCRIPT_DIR=$(CDPATH="" cd -- "$(dirname -- "$0")" && pwd -P)
+
+relay_status_board() {
+  if [ -t 1 ]; then
+    divider='============'
+  else
+    divider='------------'
+  fi
+
+  kits_section=$(relay_status_section_kits)
+  personas_section=$(relay_status_section_personas)
+  guidance_section=$(relay_status_section_guidance)
+
+  printf '%s\n%s\n\n%s\n\n%s\n\n%s\n' \
+    'Relay status' \
+    "$divider" \
+    "$kits_section" \
+    "$personas_section" \
+    "$guidance_section"
+}
+
+relay_status_trim() {
+  value="$1"
+  printf '%s' "$value" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
+relay_status_active_personas() {
+  combined=""
+  for value in "${RELAY_TUI_ACTIVE_PERSONAS:-}" "${RELAY_ACTIVE_PERSONAS:-}" "${RELAY_ACTIVE_PERSONA:-}" "${RELAY_PERSONA:-}"; do
+    [ -n "$value" ] || continue
+    normalized=$(printf '%s' "$value" | tr ',:' ' ')
+    for token in $normalized; do
+      [ -n "$token" ] || continue
+      if [ -z "$combined" ]; then
+        combined="$token"
+      else
+        combined="$combined $token"
+      fi
+    done
+  done
+  printf '%s\n' "$combined"
+}
+
+relay_status_section_kits() {
+  printf '%s\n' 'Kits'
+  if ! [ -x "$SCRIPT_DIR/relay-kit" ]; then
+    printf '  relay-kit command unavailable\n'
+    return
+  fi
+
+  kits_status=$("$SCRIPT_DIR/relay-kit" status 2>/dev/null)
+  if [ -n "$kits_status" ]; then
+    while IFS=':' read -r name state; do
+      name_trim=$(relay_status_trim "$name")
+      state_trim=$(relay_status_trim "$state")
+      [ -n "$name_trim" ] || continue
+      [ -n "$state_trim" ] || state_trim='(unknown)'
+      printf '  %-10s %s\n' "[$state_trim]" "$name_trim"
+    done <<EOF
+$kits_status
+EOF
+    return
+  fi
+
+  kits_list=$("$SCRIPT_DIR/relay-kit" list 2>/dev/null)
+  if [ -z "$kits_list" ]; then
+    printf "  (no kits found - try 'relay kit edit demo')\n"
+    return
+  fi
+  while IFS= read -r kit; do
+    [ -n "$kit" ] || continue
+    printf '  %-10s %s\n' '[stopped]' "$kit"
+  done <<EOF
+$kits_list
+EOF
+}
+
+relay_status_section_personas() {
+  printf '%s\n' 'Personas'
+  if ! [ -x "$SCRIPT_DIR/relay-persona" ]; then
+    printf '  relay-persona command unavailable\n'
+    return
+  fi
+
+  personas_output=$("$SCRIPT_DIR/relay-persona" list 2>/dev/null)
+  if [ -z "$personas_output" ]; then
+    printf "  (no personas found - try 'relay persona edit demo')\n"
+    return
+  fi
+
+  active_list=$(relay_status_active_personas)
+  while IFS= read -r persona; do
+    [ -n "$persona" ] || continue
+    marker='[ ]'
+    for active in $active_list; do
+      if [ "$active" = "$persona" ]; then
+        marker='[*]'
+        break
+      fi
+    done
+    printf '  %s %s\n' "$marker" "$persona"
+  done <<EOF
+$personas_output
+EOF
+}
+
+relay_status_section_guidance() {
+  cat <<'EOF'
+Quick commands
+  relay kit status      # check kit sessions
+  relay persona show X  # inspect persona
+  relay events tail     # follow event log
+  relay doctor          # environment checks
+EOF
+}
+
+relay_launch_tui() {
+  if ! [ -x "$SCRIPT_DIR/relay-tui" ]; then
+    echo "relay-tui missing" >&2
+    relay_status_board
+    return 127
+  fi
+  "$SCRIPT_DIR/relay-tui" "$@"
+  status=$?
+  if [ "$status" -ne 0 ]; then
+    echo "Relay TUI exited with status $status" >&2
+    relay_status_board
+  fi
+  return $status
+}
+
+print_help() {
+  cat <<'EOF'
+Usage: relay [command]
+
+Commands:
+  help            Show this help
+  version         Show version
+  status          Display current Relay status board
+  doctor          Environment checks
+  events          Event log helper
+  kit             Kit management
+  persona         Persona overlays
+  tui             Launch the interactive TUI
+
+Without arguments Relay launches the TUI when available and falls back to the
+status board otherwise.
+EOF
+}
+
+CMD="${1:-}"
+[ $# -gt 0 ] && shift
+
+if [ -z "$CMD" ]; then
+  relay_launch_tui "$@"
+  exit $?
+fi
+
+case "$CMD" in
+  help|-h|--help)
+    print_help
+    ;;
+  version|--version)
+    echo "relay 0.1.0"
+    ;;
+  status)
+    relay_status_board
+    ;;
+  doctor)
+    if [ -x "$SCRIPT_DIR/relay-doctor" ]; then
+      exec "$SCRIPT_DIR/relay-doctor" "$@"
+    else
+      echo "relay-doctor not installed" >&2
+      exit 127
+    fi
+    ;;
+  events)
+    if [ -x "$SCRIPT_DIR/relay-events" ]; then
+      exec "$SCRIPT_DIR/relay-events" "$@"
+    else
+      echo "relay-events not installed" >&2
+      exit 127
+    fi
+    ;;
+  kit)
+    if [ -x "$SCRIPT_DIR/relay-kit" ]; then
+      exec "$SCRIPT_DIR/relay-kit" "$@"
+    else
+      echo "relay-kit not installed" >&2
+      exit 127
+    fi
+    ;;
+  persona)
+    if [ -x "$SCRIPT_DIR/relay-persona" ]; then
+      exec "$SCRIPT_DIR/relay-persona" "$@"
+    else
+      echo "relay-persona not installed" >&2
+      exit 127
+    fi
+    ;;
+  tui)
+    relay_launch_tui "$@"
+    ;;
+  *)
+    if [ $# -gt 0 ]; then
+      subcmd="$1"
+      shift
+      case "$subcmd" in
+        up|start)
+          exec "$SCRIPT_DIR/relay-kit" up "$CMD" "$@"
+          ;;
+        down|stop)
+          exec "$SCRIPT_DIR/relay-kit" stop "$CMD" "$@"
+          ;;
+        status)
+          exec "$SCRIPT_DIR/relay-kit" status "$CMD" "$@"
+          ;;
+        use|activate)
+          exec "$SCRIPT_DIR/relay-persona" use "$CMD" "$@"
+          ;;
+        show)
+          exec "$SCRIPT_DIR/relay-persona" show "$CMD" "$@"
+          ;;
+        edit)
+          exec "$SCRIPT_DIR/relay-persona" edit "$CMD" "$@"
+          ;;
+      esac
+    fi
+    if [ -x "$SCRIPT_DIR/relay-kit" ]; then
+      exec "$SCRIPT_DIR/relay-kit" "$CMD" "$@"
+    fi
+    echo "Unknown command: $CMD" >&2
+    exit 2
+    ;;
+esac

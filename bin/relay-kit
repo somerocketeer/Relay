@@ -1,0 +1,1289 @@
+#!/usr/bin/env sh
+# relay-kit: minimal tmux kit launcher with persona layering support
+
+SCRIPT_DIR=$(CDPATH="" cd -- "$(dirname -- "$0")" && pwd -P)
+LIB_DIR=$(CDPATH="" cd -- "$SCRIPT_DIR/.." && pwd -P)/lib
+KITS_DIR=${RELAY_KITS_DIR:-$HOME/.local/share/relay/kits}
+PERSONAS_DIR=${RELAY_PERSONAS_DIR:-$HOME/.local/share/relay/personas}
+tmux_with_socket() {
+  if [ -n "${RELAY_TMUX_SOCKET_NAME:-}" ]; then
+    tmux -L "$RELAY_TMUX_SOCKET_NAME" "$@"
+  elif [ -n "${RELAY_TMUX_SOCKET:-}" ]; then
+    tmux -S "$RELAY_TMUX_SOCKET" "$@"
+  else
+    tmux "$@"
+  fi
+}
+
+validate_identifier() {
+  case "$1" in
+    ''|.*|*/*|*'..'*)
+      return 1
+      ;;
+  esac
+  return 0
+}
+
+ensure_safe_name() {
+  kind="$1"
+  name="$2"
+  if ! validate_identifier "$name"; then
+    printf 'Invalid %s name: %s\n' "$kind" "$name" >&2
+    exit 2
+  fi
+}
+
+sanitize_kit_name() {
+  name_raw="$1"
+  cleaned=$(printf '%s' "$name_raw" | tr '[:upper:]' '[:lower:]')
+  cleaned=$(printf '%s' "$cleaned" | tr -c 'a-z0-9-_' '-')
+  cleaned=$(printf '%s' "$cleaned" | sed 's/-\{2,\}/-/g; s/_\{2,\}/_/g; s/^-//; s/-$//; s/^_//; s/_$//')
+  if [ -z "$cleaned" ]; then
+    cleaned="imported"
+  fi
+  printf '%s\n' "$cleaned"
+ }
+
+expand_home() {
+  value="$1"
+  # shellcheck disable=SC2088
+  case "$value" in
+    "~")
+      printf '%s\n' "$HOME"
+      ;;
+    "~/"*)
+      printf '%s/%s\n' "$HOME" "${value#~/}"
+      ;;
+    *)
+      printf '%s\n' "$value"
+      ;;
+  esac
+}
+
+resolve_pane_workdir() {
+  base="$1"
+  fallback="$2"
+  pane_dir="$3"
+  pane_workdir="$base"
+  [ -n "$pane_dir" ] || {
+    printf '%s\n' "$pane_workdir"
+    return
+  }
+  pane_dir_clean=$(printf '%s' "$pane_dir" | tr -d '\r' | tr -d '\n')
+  # shellcheck disable=SC2088
+  case "$pane_dir_clean" in
+    "~")
+      if [ -n "$HOME" ]; then
+        pane_workdir="$HOME"
+      elif [ -n "$fallback" ] && [ -d "$fallback" ]; then
+        pane_workdir="$fallback"
+      fi
+      ;;
+    "~/"*)
+      expanded=$(expand_home "$pane_dir_clean")
+      if [ -d "$expanded" ]; then
+        pane_workdir="$expanded"
+      elif [ -n "$fallback" ] && [ -d "$fallback" ]; then
+        pane_workdir="$fallback"
+      fi
+      ;;
+    *)
+      expanded=$(expand_home "$pane_dir_clean")
+      if [ -d "$expanded" ]; then
+        pane_workdir="$expanded"
+      elif [ -n "$fallback" ] && [ -d "$fallback" ]; then
+        pane_workdir="$fallback"
+      fi
+      ;;
+  esac
+  printf '%s\n' "$pane_workdir"
+}
+
+quote_arg() {
+  value="$1"
+  if [ -z "$value" ]; then
+    printf "''\n"
+    return
+  fi
+  escaped=$(printf '%s' "$value" | sed "s/'/'\\''/g")
+  printf "'%s'\n" "$escaped"
+}
+
+TAB=$(printf '\t')
+PLAN_FILE=""
+PLAN_WINDOWS_FILE=""
+
+cleanup_plan_file() {
+  if [ -n "$PLAN_FILE" ] && [ -f "$PLAN_FILE" ]; then
+    rm -f "$PLAN_FILE"
+  fi
+  if [ -n "$PLAN_WINDOWS_FILE" ] && [ -f "$PLAN_WINDOWS_FILE" ]; then
+    rm -f "$PLAN_WINDOWS_FILE"
+  fi
+  PLAN_FILE=""
+  PLAN_WINDOWS_FILE=""
+}
+
+decode_b64() {
+  if command -v base64 >/dev/null 2>&1; then
+    base64 --decode
+  else
+    python3 - <<'PY'
+import sys
+import base64
+
+data = sys.stdin.read().strip()
+if data:
+    sys.stdout.write(base64.b64decode(data).decode())
+PY
+  fi
+}
+
+decode_plan_field() {
+  value="$1"
+  if [ -z "$value" ] || [ "$value" = "-" ]; then
+    printf '\n'
+    return
+  fi
+  printf '%s\n' "$value" | decode_b64
+}
+
+build_persona_wrapped_command() {
+  helper_path="$1"
+  personas_blob="$2"
+  base_command="$3"
+
+  if [ -z "$personas_blob" ]; then
+    printf '%s\n' "$base_command"
+    return
+  fi
+
+  set -- "$helper_path" exec
+  while IFS= read -r persona_name; do
+    [ -n "$persona_name" ] || continue
+    set -- "$@" "$persona_name"
+  done <<EOF
+$personas_blob
+EOF
+
+  result=""
+  while [ $# -gt 0 ]; do
+    arg="$1"
+    shift
+    quoted=$(quote_arg "$arg")
+    if [ -z "$result" ]; then
+      result="$quoted"
+    else
+      result="$result $quoted"
+    fi
+  done
+  printf '%s -- %s\n' "$result" "$base_command"
+}
+
+usage() {
+  cat <<'EOF'
+Usage: relay kit <command>
+
+Commands:
+  list|ls                List kit names
+  start|up [options] <name>
+                         Start kit in tmux (applies kit personas)
+  stop|down <name>       Stop kit's tmux session
+  edit <name>            Open kit configuration in editor
+  status [<name>]        Show kit status (all kits when omitted)
+  import [options] <session>
+                         Capture a tmux session into a kit.toml
+  persona assign [--replace] <name> <window>:<pane> <persona>...
+                         Layer personas onto a specific pane (default append)
+  persona clear <name> <window>:<pane>
+                         Remove pane-level persona overlay
+  <name>                 Shortcut for start <name>
+
+Start options:
+  --no-persona           Skip personas declared in kit.toml
+  --persona <name>       Apply persona (repeatable, evaluated after defaults)
+  --dry-run              Print the tmux plan without launching the session
+
+Import options:
+  --list                 Show native tmux sessions that can be imported
+  --output <name>        Override the generated kit name
+  --dry-run              Print the generated kit.toml without writing files
+  --interactive          Offer automatic fixes for common patterns
+  --edit                 Open the generated kit in the editor after import
+EOF
+}
+
+list_kits() {
+  if [ ! -d "$KITS_DIR" ]; then
+    return
+  fi
+  set -- "$KITS_DIR"/*
+  if [ "$1" = "$KITS_DIR/*" ]; then
+    return
+  fi
+  for kit_path in "$@"; do
+    [ -d "$kit_path" ] || continue
+    printf '%s\n' "${kit_path##*/}"
+  done | sort
+}
+
+list_importable_sessions() {
+  if ! command -v tmux >/dev/null 2>&1; then
+    echo "tmux is required to inspect sessions" >&2
+    return 3
+  fi
+  sessions_output=$(tmux_with_socket list-sessions -F '#{session_name}' 2>&1)
+  status=$?
+  if [ "$status" -ne 0 ]; then
+    printf 'Failed to list tmux sessions: %s\n' "$sessions_output" >&2
+    return "$status"
+  fi
+  [ -n "$sessions_output" ] || return 0
+  printf '%s\n' "$sessions_output" | while IFS= read -r session_name; do
+    [ -n "$session_name" ] || continue
+    case "$session_name" in
+      relay-*)
+        continue
+        ;;
+    esac
+    printf '%s\n' "$session_name"
+  done | sort
+}
+
+parse_kit() {
+  kit_name="$1"
+  kit_file="$2"
+  kit_dir="$3"
+  if [ ! -f "$kit_file" ]; then
+    return 0
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "python3 is required to parse kit.toml; launching bare session" >&2
+    return 1
+  fi
+  PYTHONPATH="$LIB_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 - "$kit_file" "$kit_name" "$kit_dir" <<'PYCFG'
+import base64
+import sys
+
+from relay_toml import TomlMissingError
+
+try:
+    from relay_kit_config import (
+        dedupe_personas,
+        load_kit_config,
+        load_pane_overlays,
+        overlay_key,
+    )
+except TomlMissingError as exc:
+    print(exc, file=sys.stderr)
+    sys.exit(3)
+
+kit_file, kit_name, kit_dir = sys.argv[1:4]
+try:
+    config = load_kit_config(kit_file, kit_dir)
+except TomlMissingError as exc:
+    print(exc, file=sys.stderr)
+    sys.exit(3)
+overlays = load_pane_overlays(kit_dir)
+
+
+def b64(value):
+    if not value:
+        return '-'
+    return base64.b64encode(value.encode()).decode()
+
+
+print(f"SESSION:{config['session']}")
+print(f"DIR:{config['workdir']}")
+print(f"ATTACH:{1 if config.get('attach', True) else 0}")
+
+for persona in config.get('kit_personas', []):
+    print(f"PERSONA:{persona}")
+
+for window in config.get('windows', []):
+    print(
+        "WINDOW::{}::{}::{}::{}".format(
+            window['index'],
+            b64(window.get('name', '')),
+            b64(window.get('dir', '')),
+            b64(window.get('layout', '')),
+        )
+    )
+    for pane in window.get('panes', []):
+        run = (pane.get('run') or '').strip()
+        if not run:
+            continue
+        combined = dedupe_personas(
+            pane.get('personas', []),
+            overlays.get(overlay_key(window['index'], pane['index']), []),
+        )
+        persona_blob = '\n'.join(combined)
+        print(
+            "CMD::{}::{}::{}::{}::{}::{}".format(
+                window['index'],
+                pane['index'],
+                b64(run),
+                b64(persona_blob),
+                b64(pane.get('name', '')),
+                b64(pane.get('dir', '')),
+            )
+        )
+PYCFG
+}
+
+session_name() {
+  printf 'relay-%s' "$1"
+}
+
+kit_running() {
+  kit_name="$1"
+  if ! command -v tmux >/dev/null 2>&1; then
+    return 1
+  fi
+  session=$(session_name "$kit_name")
+  tmux has-session -t "$session" 2>/dev/null
+}
+
+ensure_relay_persona() {
+  helper="$SCRIPT_DIR/relay-persona"
+  if [ ! -x "$helper" ]; then
+    echo "relay-persona helper not found" >&2
+    return 1
+  fi
+  printf '%s\n' "$helper"
+}
+
+apply_persona_exports() {
+  persona_name="$1"
+  helper=$(ensure_relay_persona) || return 1
+  exports=$("$helper" use "$persona_name") || {
+    echo "Failed to load persona: $persona_name" >&2
+    return 1
+  }
+  [ -n "$exports" ] || return 0
+  tmp=$(mktemp) || return 1
+  printf '%s\n' "$exports" > "$tmp"
+  # shellcheck disable=SC1090
+  . "$tmp"
+  status=$?
+  rm -f "$tmp"
+  return $status
+}
+
+apply_persona_list() {
+  list="$1"
+  [ -n "$list" ] || return 0
+  while IFS= read -r persona_name; do
+    [ -n "$persona_name" ] || continue
+    apply_persona_exports "$persona_name" || return 1
+  done <<EOF
+${list}
+EOF
+}
+
+pick_editor() {
+  if [ -n "${RELAY_EDITOR:-}" ]; then
+    printf '%s\n' "$RELAY_EDITOR"
+    return
+  fi
+  if [ -n "${EDITOR:-}" ]; then
+    printf '%s\n' "$EDITOR"
+    return
+  fi
+  if [ -n "${VISUAL:-}" ]; then
+    printf '%s\n' "$VISUAL"
+    return
+  fi
+  for candidate in hx helix nvim vim nano vi; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      printf '%s\n' "$candidate"
+      return
+    fi
+  done
+  printf '%s\n' 'vi'
+}
+
+open_in_editor() {
+  target="$1"
+  editor=$(pick_editor)
+  if [ -z "$editor" ]; then
+    echo "No editor configured" >&2
+    return 1
+  fi
+  # shellcheck disable=SC2086
+  set -- $editor
+  cmd="$1"
+  shift
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    printf 'Editor not found: %s\n' "$cmd" >&2
+    return 1
+  fi
+  "$cmd" "$@" "$target"
+}
+
+default_kit_config() {
+  cat <<'TOML'
+version = 1
+session = "example"
+dir = "~/"
+attach = true
+
+# commands = ["echo pre-flight"]
+# requires = ["tmux"]
+# personas = ["work"]
+
+[[windows]]
+name = "main"
+layout = "tiled"
+dir = "~/"
+panes = [
+  "echo customize panes",
+]
+TOML
+}
+
+edit_kit_config() {
+  kit_name="$1"
+  ensure_safe_name kit "$kit_name"
+  kit_dir="$KITS_DIR/$kit_name"
+  kit_file="$kit_dir/kit.toml"
+  mkdir -p "$kit_dir" || return 1
+  if [ ! -f "$kit_file" ]; then
+    default_kit_config > "$kit_file"
+  fi
+  open_in_editor "$kit_file"
+}
+
+stop_kit() {
+  kit_name="$1"
+  ensure_safe_name kit "$kit_name"
+  if [ -z "$kit_name" ]; then
+    echo "Kit name required" >&2
+    return 2
+  fi
+  if ! command -v tmux >/dev/null 2>&1; then
+    echo "tmux is required to stop kits" >&2
+    return 3
+  fi
+  session=$(session_name "$kit_name")
+  if tmux has-session -t "$session" 2>/dev/null; then
+    tmux kill-session -t "$session" 2>/dev/null || {
+      echo "Failed to stop kit: $kit_name" >&2
+      return 4
+    }
+    echo "Kit $kit_name stopped"
+    return 0
+  fi
+  echo "Kit $kit_name is not running" >&2
+  return 0
+}
+
+kit_status() {
+  kit_name="$1"
+  ensure_safe_name kit "$kit_name"
+  if kit_running "$kit_name"; then
+    echo "$kit_name: running"
+  else
+    echo "$kit_name: stopped"
+  fi
+}
+
+cmd_import() {
+  if ! command -v tmux >/dev/null 2>&1; then
+    echo "tmux is required to import sessions" >&2
+    return 3
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "python3 is required to generate kit files" >&2
+    return 3
+  fi
+
+  list_mode=0
+  dry_run=0
+  interactive=0
+  edit_after=0
+  kit_name_override=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --list)
+        list_mode=1
+        shift
+        ;;
+      --dry-run)
+        dry_run=1
+        shift
+        ;;
+      --interactive)
+        interactive=1
+        shift
+        ;;
+      --output)
+        shift
+        if [ $# -eq 0 ]; then
+          echo "--output requires a kit name" >&2
+          return 2
+        fi
+        kit_name_override="$1"
+        shift
+        ;;
+      --edit)
+        edit_after=1
+        shift
+        ;;
+      -h|--help)
+        usage
+        return 0
+        ;;
+      --)
+        shift
+        break
+        ;;
+      -*)
+        printf 'Unknown option for relay kit import: %s\n' "$1" >&2
+        return 2
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+
+  if [ "$list_mode" = "1" ]; then
+    if [ $# -gt 0 ]; then
+      printf 'Unexpected argument: %s\n' "$1" >&2
+      return 2
+    fi
+    list_importable_sessions
+    return $?
+  fi
+
+  if [ "$dry_run" = "1" ] && [ "$edit_after" = "1" ]; then
+    echo "--edit cannot be combined with --dry-run" >&2
+    return 2
+  fi
+
+  if [ $# -eq 0 ]; then
+    echo "Session name required" >&2
+    return 2
+  fi
+  session_name="$1"
+  shift
+  if [ $# -gt 0 ]; then
+    printf 'Unexpected argument: %s\n' "$1" >&2
+    return 2
+  fi
+
+  tmux_check=$(tmux_with_socket has-session -t "$session_name" 2>&1)
+  status=$?
+  if [ "$status" -ne 0 ]; then
+    case "$tmux_check" in
+      *"error connecting"*)
+        printf 'Failed to connect to tmux: %s\n' "$tmux_check" >&2
+        ;;
+      *)
+        printf "Session not found: %s\n" "$session_name" >&2
+        ;;
+    esac
+    return 2
+  fi
+
+  if [ -z "$kit_name_override" ]; then
+    kit_name=$(sanitize_kit_name "$session_name")
+  else
+    kit_name=$(sanitize_kit_name "$kit_name_override")
+  fi
+  ensure_safe_name kit "$kit_name"
+
+  kit_dir="$KITS_DIR/$kit_name"
+  kit_file="$kit_dir/kit.toml"
+  warnings_file="$kit_dir/import.log"
+
+  if [ "$dry_run" != "1" ]; then
+    if [ -f "$kit_file" ]; then
+      printf 'Kit already exists: %s\n' "$kit_name" >&2
+      return 2
+    fi
+    mkdir -p "$kit_dir" || return 1
+  fi
+
+  python_path="$LIB_DIR${PYTHONPATH:+:$PYTHONPATH}"
+  if [ "$dry_run" = "1" ]; then
+    set -- "$session_name" "$kit_name"
+    if [ "$interactive" = "1" ]; then
+      set -- "$@" --interactive
+    fi
+    # shellcheck disable=SC2086
+    PYTHONPATH="$python_path" python3 -m relay_tmux_import "$@"
+    return $?
+  fi
+
+  set -- "$session_name" "$kit_name" --output "$kit_file" --warnings "$warnings_file"
+  if [ "$interactive" = "1" ]; then
+    set -- "$@" --interactive
+  fi
+  # shellcheck disable=SC2086
+  if ! PYTHONPATH="$python_path" python3 -m relay_tmux_import "$@"; then
+    return $?
+  fi
+
+  if [ ! -f "$kit_file" ]; then
+    echo "Kit file was not created" >&2
+    return 1
+  fi
+
+  echo "Imported $session_name -> $kit_file"
+  if [ -f "$warnings_file" ]; then
+    echo "Warnings logged to $warnings_file"
+  fi
+  echo "Review with: relay kit edit $kit_name"
+
+  if [ "$edit_after" = "1" ]; then
+    open_in_editor "$kit_file"
+  fi
+}
+
+start_kit() {
+  kit_name="$1"
+  ensure_safe_name kit "$kit_name"
+  apply_default_personas="${START_USE_DEFAULT_PERSONAS:-1}"
+  extra_personas="${START_EXTRA_PERSONAS:-}"
+  dry_run_mode="${START_DRY_RUN:-0}"
+  unset START_USE_DEFAULT_PERSONAS START_EXTRA_PERSONAS START_DRY_RUN
+
+  kit_dir="$KITS_DIR/$kit_name"
+  if [ ! -d "$kit_dir" ]; then
+    echo "Kit not found: $kit_name" >&2
+    return 2
+  fi
+  if [ "$dry_run_mode" != "1" ] && ! command -v tmux >/dev/null 2>&1; then
+    echo "tmux is required to launch kits" >&2
+    return 3
+  fi
+
+  session=$(session_name "$kit_name")
+  workdir="$kit_dir"
+  attach=1
+  persona_list_config=""
+  config_file="$kit_dir/kit.toml"
+  PLAN_FILE=$(mktemp) || return 1
+  PLAN_WINDOWS_FILE=$(mktemp) || {
+    rm -f "$PLAN_FILE"
+    PLAN_FILE=""
+    PLAN_WINDOWS_FILE=""
+    return 1
+  }
+  trap 'cleanup_plan_file; trap - INT TERM EXIT' INT TERM EXIT
+
+  parsed=$(parse_kit "$kit_name" "$config_file" "$kit_dir")
+  status=$?
+  if [ "$status" -eq 0 ] && [ -n "$parsed" ]; then
+    while IFS= read -r line; do
+      case "$line" in
+        SESSION:*)
+          session="${line#SESSION:}"
+          ;;
+        DIR:*)
+          workdir="${line#DIR:}"
+          ;;
+        ATTACH:*)
+          attach="${line#ATTACH:}"
+          ;;
+        PERSONA:*)
+          persona_list_config="${persona_list_config}${line#PERSONA:}
+"
+          ;;
+        WINDOW::*)
+          rest=${line#WINDOW::}
+          window_idx=${rest%%::*}
+          rest=${rest#*::}
+          window_name_b64=${rest%%::*}
+          rest=${rest#*::}
+          window_dir_b64=${rest%%::*}
+          window_layout_b64=${rest#*::}
+          printf '%s%s%s%s%s%s%s\n' "$window_idx" "$TAB" "$window_name_b64" "$TAB" "$window_dir_b64" "$TAB" "$window_layout_b64" >> "$PLAN_WINDOWS_FILE"
+          ;;
+        CMD::*)
+          rest=${line#CMD::}
+          window_idx=${rest%%::*}
+          rest=${rest#*::}
+          pane_idx=${rest%%::*}
+          rest=${rest#*::}
+          cmd_b64=${rest%%::*}
+          rest=${rest#*::}
+          persona_b64=${rest%%::*}
+          rest=${rest#*::}
+          pane_name_b64=${rest%%::*}
+          dir_b64=${rest#*::}
+          printf '%s%s%s%s%s%s%s%s%s%s%s\n' "$window_idx" "$TAB" "$pane_idx" "$TAB" "$cmd_b64" "$TAB" "$persona_b64" "$TAB" "$pane_name_b64" "$TAB" "$dir_b64" >> "$PLAN_FILE"
+          ;;
+      esac
+    done <<EOF
+$parsed
+EOF
+  fi
+
+  persona_list=""
+  if [ "$apply_default_personas" != "0" ]; then
+    persona_list="$persona_list_config"
+  fi
+  if [ -n "$extra_personas" ]; then
+    persona_list="${persona_list}${extra_personas}"
+  fi
+  persona_blob_execute="$persona_list"
+  if [ "$dry_run_mode" != "1" ] && [ -n "$persona_list" ]; then
+    apply_persona_list "$persona_list" || {
+      cleanup_plan_file
+      return 1
+    }
+  fi
+
+  workdir_expanded=$(expand_home "$workdir")
+  if [ -d "$workdir_expanded" ]; then
+    workdir="$workdir_expanded"
+  else
+    workdir="$kit_dir"
+  fi
+
+  if [ "$dry_run_mode" = "1" ]; then
+    attach_text='yes'
+    if [ "$attach" = "0" ]; then
+      attach_text='no'
+    fi
+    printf 'Kit: %s\n' "$kit_name"
+    printf 'Session: %s\n' "$session"
+    printf 'Root dir: %s\n' "$workdir"
+    printf 'Attach: %s\n' "$attach_text"
+    if [ -n "$persona_list_config" ]; then
+      printf 'Kit personas:\n'
+      while IFS= read -r persona_name; do
+        [ -n "$persona_name" ] || continue
+        printf '  - %s\n' "$persona_name"
+      done <<EOF_KIT_PERSONA
+$persona_list_config
+EOF_KIT_PERSONA
+    fi
+    if [ -n "$extra_personas" ]; then
+      printf 'Extra personas:\n'
+      while IFS= read -r persona_name; do
+        [ -n "$persona_name" ] || continue
+        printf '  - %s\n' "$persona_name"
+      done <<EOF_EXTRA_PERSONA
+$extra_personas
+EOF_EXTRA_PERSONA
+    fi
+    if [ ! -f "$PLAN_FILE" ] || [ ! -s "$PLAN_FILE" ]; then
+      printf 'No run commands defined in kit.\n'
+      cleanup_plan_file
+      return 0
+    fi
+    printf '\n'
+    printf 'Windows:\n'
+  fi
+
+  first_pane_workdir="$workdir"
+  if [ -f "$PLAN_FILE" ] && [ -s "$PLAN_FILE" ]; then
+    first_line=$(sed -n '1p' "$PLAN_FILE")
+    if [ -n "$first_line" ]; then
+      IFS="$TAB" read -r _ _ _ _ _ first_dir_b64 <<EOF_FIRST
+$first_line
+EOF_FIRST
+      first_dir_value=""
+      if [ "$first_dir_b64" != "-" ]; then
+        first_dir_value=$(printf '%s\n' "$first_dir_b64" | decode_b64)
+      fi
+      first_pane_workdir=$(resolve_pane_workdir "$workdir" "$kit_dir" "$first_dir_value")
+      if [ -n "${RELAY_DEBUG:-}" ]; then
+        echo "DEBUG first column first pane workdir:$first_pane_workdir" >&2
+      fi
+    fi
+  fi
+
+  initial_pane_target=""
+  if [ "$dry_run_mode" != "1" ]; then
+    tmux has-session -t "$session" 2>/dev/null || tmux new-session -ds "$session" -c "$first_pane_workdir"
+
+    initial_pane_target=$(tmux display-message -p -t "$session" '#{pane_id}' 2>/dev/null || printf '')
+    if [ -z "$initial_pane_target" ]; then
+      initial_pane_target="$session:"
+    fi
+  fi
+
+  persona_helper=""
+  cmd_index=0
+  _relay_last_window_printed=""
+  if [ -f "$PLAN_FILE" ] && [ -s "$PLAN_FILE" ]; then
+    while IFS="$TAB" read -r window_idx pane_idx cmd_b64 persona_b64 pane_name_b64 dir_b64; do
+      [ "$cmd_b64" = "-" ] && continue
+      command=$(printf '%s
+' "$cmd_b64" | decode_b64)
+      [ -n "$command" ] || continue
+      pane_persona_blob=""
+      if [ "$persona_b64" != "-" ]; then
+        pane_persona_blob=$(printf '%s
+' "$persona_b64" | decode_b64)
+      fi
+      pane_dir=""
+      if [ "$dir_b64" != "-" ]; then
+        pane_dir=$(printf '%s
+' "$dir_b64" | decode_b64)
+      fi
+      combined_persona_blob=""
+      if [ -n "$persona_blob_execute" ]; then
+        combined_persona_blob="$persona_blob_execute"
+      fi
+      if [ -n "$pane_persona_blob" ]; then
+        if [ -n "$combined_persona_blob" ]; then
+          combined_persona_blob=$(printf '%s
+%s' "$combined_persona_blob" "$pane_persona_blob")
+        else
+          combined_persona_blob="$pane_persona_blob"
+        fi
+      fi
+      pane_workdir=$(resolve_pane_workdir "$workdir" "$kit_dir" "$pane_dir")
+      if [ "$dry_run_mode" = "1" ]; then
+        window_name=""
+        window_dir_raw=""
+        window_layout=""
+        if [ -f "$PLAN_WINDOWS_FILE" ]; then
+          while IFS="$TAB" read -r idx name_b64 dir_b64 layout_b64; do
+            if [ "$idx" = "$window_idx" ]; then
+              window_name=$(decode_plan_field "$name_b64")
+              window_dir_raw=$(decode_plan_field "$dir_b64")
+              window_layout=$(decode_plan_field "$layout_b64")
+              break
+            fi
+          done < "$PLAN_WINDOWS_FILE"
+        fi
+        window_number=$((window_idx + 1))
+        pane_number=$((pane_idx + 1))
+        if [ "$window_idx" != "$_relay_last_window_printed" ]; then
+          window_dir_display="$workdir"
+          if [ -n "$window_dir_raw" ]; then
+            window_dir_display=$(resolve_pane_workdir "$workdir" "$kit_dir" "$window_dir_raw")
+          fi
+          window_label="$window_number"
+          if [ -n "$window_name" ]; then
+            window_label="$window_label ($window_name)"
+          fi
+          if [ -n "$window_layout" ]; then
+            printf '  [%s] layout=%s\n' "$window_label" "$window_layout"
+          else
+            printf '  [%s]\n' "$window_label"
+          fi
+          printf '    Dir: %s\n' "$window_dir_display"
+          _relay_last_window_printed="$window_idx"
+        fi
+        pane_label="$pane_number"
+        pane_name=$(decode_plan_field "$pane_name_b64")
+        if [ -n "$pane_name" ]; then
+          pane_label="$pane_label ($pane_name)"
+        fi
+        printf '    Pane %s\n' "$pane_label"
+        if [ -n "$pane_workdir" ]; then
+          printf '      Dir: %s\n' "$pane_workdir"
+        fi
+        if [ -n "$combined_persona_blob" ]; then
+          printf '      Personas:\n'
+          while IFS= read -r persona_name; do
+            [ -n "$persona_name" ] || continue
+            printf '        - %s\n' "$persona_name"
+          done <<EOF_PANE_PERSONA
+$combined_persona_blob
+EOF_PANE_PERSONA
+        fi
+        printf '      Command: %s\n' "$command"
+        continue
+      fi
+      command_to_run="$command"
+      if [ -n "$combined_persona_blob" ]; then
+        if [ -z "$persona_helper" ]; then
+          persona_helper=$(ensure_relay_persona) || {
+            cleanup_plan_file
+            return 1
+          }
+        fi
+        command_to_run=$(build_persona_wrapped_command "$persona_helper" "$combined_persona_blob" "$command") || {
+          cleanup_plan_file
+          return 1
+        }
+        if [ -n "$PERSONAS_DIR" ]; then
+          personas_env_assignment=$(quote_arg "$PERSONAS_DIR")
+          command_to_run="RELAY_PERSONAS_DIR=$personas_env_assignment $command_to_run"
+        fi
+      fi
+      if [ -n "$pane_workdir" ]; then
+        command_to_run="cd -- $(quote_arg "$pane_workdir") && $command_to_run"
+      fi
+      if [ "$cmd_index" -eq 0 ]; then
+        target_pane="$initial_pane_target"
+        tmux send-keys -t "$target_pane" "$command_to_run" C-m
+      else
+        pane_target=$(tmux new-window -P -F '#{pane_id}' -t "$session" -c "$pane_workdir" 2>/dev/null || printf '')
+        if [ -z "$pane_target" ]; then
+          pane_target=$(tmux list-panes -t "$session" -F '#{pane_id}' | tail -n1 2>/dev/null || printf '')
+        fi
+        if [ -z "$pane_target" ]; then
+          cleanup_plan_file
+          echo "Failed to determine pane for new window" >&2
+          return 1
+        fi
+        tmux send-keys -t "$pane_target" "$command_to_run" C-m
+      fi
+      cmd_index=$((cmd_index + 1))
+    done < "$PLAN_FILE"
+  fi
+  if [ "$dry_run_mode" = "1" ]; then
+    cleanup_plan_file
+    unset _relay_last_window_printed
+    return 0
+  fi
+
+  unset _relay_last_window_printed
+  cleanup_plan_file
+
+  if [ -n "${TMUX:-}" ]; then
+    tmux switch-client -t "$session"
+    return 0
+  fi
+  if [ "$attach" = "1" ] || [ -z "$attach" ]; then
+    tmux attach -t "$session"
+  else
+    echo "Kit $kit_name started in tmux session $session"
+  fi
+}
+
+update_pane_personas() {
+  kit_name="$1"
+  ensure_safe_name kit "$kit_name"
+  target="$2"
+  mode="$3"
+  personas_blob="$4"
+
+  kit_dir="$KITS_DIR/$kit_name"
+  kit_file="$kit_dir/kit.toml"
+  if [ ! -f "$kit_file" ]; then
+    printf 'Kit configuration not found: %s\n' "$kit_name" >&2
+    return 2
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "python3 is required for persona layering" >&2
+    return 3
+  fi
+
+  output=$(RELAY_PANE_PERSONAS="$personas_blob" PYTHONPATH="$LIB_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 - "$kit_dir" "$kit_file" "$target" "$mode" <<'PY'
+import os
+import sys
+
+from relay_kit_config import (
+    dedupe_personas,
+    load_kit_config,
+    load_pane_overlays,
+    overlay_key,
+    save_pane_overlays,
+)
+
+kit_dir, kit_file, target, mode = sys.argv[1:5]
+personas_blob = os.environ.get('RELAY_PANE_PERSONAS', '')
+personas = [item.strip() for item in personas_blob.split('\n') if item.strip()]
+
+config = load_kit_config(kit_file, kit_dir)
+wins = config.get('windows', [])
+if not wins:
+    print('No panes defined in kit configuration', file=sys.stderr)
+    sys.exit(4)
+
+if ':' in target:
+    window_token, pane_token = target.split(':', 1)
+else:
+    window_token, pane_token = '', target
+window_token = window_token.strip()
+pane_token = pane_token.strip()
+if not pane_token:
+    print('Pane identifier required (window:pane)', file=sys.stderr)
+    sys.exit(2)
+
+def resolve_window(token):
+    if not token:
+        return wins[0]
+    for window in wins:
+        name = window.get('name') or ''
+        if name and token == name:
+            return window
+    if token.isdigit():
+        idx = int(token)
+        if 1 <= idx <= len(wins):
+            return wins[idx - 1]
+        if 0 <= idx < len(wins):
+            return wins[idx]
+    return None
+
+window = resolve_window(window_token)
+if window is None:
+    print(f"Window not found: {window_token}", file=sys.stderr)
+    sys.exit(2)
+
+panes = window.get('panes', [])
+if not panes:
+    print(f"Window '{window.get('name') or window['index']}' has no panes", file=sys.stderr)
+    sys.exit(2)
+
+def resolve_pane(token):
+    for pane in panes:
+        name = pane.get('name') or ''
+        if name and token == name:
+            return pane
+    if token.isdigit():
+        idx = int(token)
+        if 1 <= idx <= len(panes):
+            return panes[idx - 1]
+        if 0 <= idx < len(panes):
+            return panes[idx]
+    return None
+
+pane = resolve_pane(pane_token)
+if pane is None:
+    print(f"Pane not found in window '{window.get('name') or window['index']}': {pane_token}", file=sys.stderr)
+    sys.exit(2)
+
+overlays = load_pane_overlays(kit_dir)
+key = overlay_key(window['index'], pane['index'])
+
+if mode == 'append':
+    if not personas:
+        print('At least one persona is required for append', file=sys.stderr)
+        sys.exit(2)
+    updated = dedupe_personas(overlays.get(key, []), personas)
+    if updated:
+        overlays[key] = updated
+    elif key in overlays:
+        overlays.pop(key)
+elif mode == 'replace':
+    if not personas:
+        print('At least one persona is required for replace', file=sys.stderr)
+        sys.exit(2)
+    overlays[key] = dedupe_personas(personas)
+elif mode == 'clear':
+    overlays.pop(key, None)
+else:
+    print(f'Unknown mode: {mode}', file=sys.stderr)
+    sys.exit(2)
+
+save_pane_overlays(kit_dir, overlays)
+window_label = window.get('name') or f"window{window['index'] + 1}"
+summary_key = f"{window_label}:{pane['index'] + 1}"
+current = overlays.get(key, [])
+print(f"UPDATED\t{summary_key}\t{','.join(current)}")
+PY
+) || return $?
+  IFS="$TAB" read -r prefix target_label persona_csv <<PARSE
+$output
+PARSE
+  if [ "$prefix" = "UPDATED" ]; then
+    if [ -n "$persona_csv" ]; then
+      printf 'Pane %s personas: %s\n' "$target_label" "$persona_csv"
+    else
+      printf 'Pane %s personas cleared\n' "$target_label"
+    fi
+  fi
+}
+
+cmd=${1:-}
+if [ $# -gt 0 ]; then
+  shift
+fi
+case "$cmd" in
+  ''|help|-h|--help)
+    usage
+    exit 0
+    ;;
+  list|ls)
+    list_kits
+    ;;
+  start|up)
+    apply_default=1
+    extra_personas=""
+    name=""
+    START_DRY_RUN=0
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --no-persona)
+          apply_default=0
+          shift
+          ;;
+        --persona)
+          shift
+          [ $# -gt 0 ] || { echo "--persona requires a name" >&2; exit 2; }
+          if [ -z "$extra_personas" ]; then
+            extra_personas="$1"
+          else
+            extra_personas=$(printf '%s\n%s' "$extra_personas" "$1")
+          fi
+          shift
+          ;;
+        --dry-run)
+          START_DRY_RUN=1
+          shift
+          ;;
+        -h|--help)
+          usage
+          exit 0
+          ;;
+        --)
+          shift
+          break
+          ;;
+        -*)
+          printf 'Unknown option for relay kit start: %s\n' "$1" >&2
+          exit 2
+          ;;
+        *)
+          if [ -z "$name" ]; then
+            name="$1"
+          else
+            printf 'Unexpected argument: %s\n' "$1" >&2
+            exit 2
+          fi
+          shift
+          ;;
+      esac
+    done
+    if [ -z "$name" ]; then
+      if [ $# -gt 0 ]; then
+        name="$1"
+        shift
+      fi
+    fi
+    [ -n "$name" ] || { usage >&2; exit 2; }
+    if [ $# -gt 0 ]; then
+      printf 'Unexpected argument: %s\n' "$1" >&2
+      exit 2
+    fi
+    START_USE_DEFAULT_PERSONAS="$apply_default"
+    START_EXTRA_PERSONAS="$extra_personas"
+    start_kit "$name"
+    status=$?
+    [ "$status" -eq 0 ] || exit "$status"
+    ;;
+  stop|down)
+    name=${1:-}
+    [ -n "$name" ] || { usage >&2; exit 2; }
+    stop_kit "$name"
+    ;;
+  edit)
+    name=${1:-}
+    [ -n "$name" ] || { usage >&2; exit 2; }
+    edit_kit_config "$name"
+    ;;
+  status)
+    if [ $# -gt 0 ]; then
+      while [ $# -gt 0 ]; do
+        kit_status "$1"
+        shift
+      done
+    else
+      if [ -d "$KITS_DIR" ]; then
+        while IFS= read -r kit; do
+          kit_status "$kit"
+        done <<EOF
+$(list_kits)
+EOF
+      fi
+    fi
+    ;;
+  import)
+    cmd_import "$@"
+    ;;
+  persona)
+    action=${1:-}
+    if [ $# -gt 0 ]; then
+      shift
+    fi
+    case "$action" in
+      assign)
+        mode="append"
+        while [ $# -gt 0 ]; do
+          case "$1" in
+            --append)
+              mode="append"
+              shift
+              ;;
+            --replace)
+              mode="replace"
+              shift
+              ;;
+            --)
+              shift
+              break
+              ;;
+            -*)
+              printf 'Unknown option for relay kit persona assign: %s\n' "$1" >&2
+              exit 2
+              ;;
+            *)
+              break
+              ;;
+          esac
+        done
+        kit=${1:-}
+        [ -n "$kit" ] || { echo "Kit name required" >&2; exit 2; }
+        shift
+        target=${1:-}
+        [ -n "$target" ] || { echo "Pane target required (window:pane)" >&2; exit 2; }
+        shift
+        if [ $# -eq 0 ]; then
+          echo "At least one persona name is required" >&2
+          exit 2
+        fi
+        personas_blob=""
+        while [ $# -gt 0 ]; do
+          case "$1" in
+            --)
+              shift
+              break
+              ;;
+            -*)
+              printf 'Unexpected option after persona list: %s\n' "$1" >&2
+              exit 2
+              ;;
+            *)
+              if [ -z "$personas_blob" ]; then
+                personas_blob="$1"
+              else
+                personas_blob=$(printf '%s\n%s' "$personas_blob" "$1")
+              fi
+              shift
+              ;;
+          esac
+        done
+        if [ $# -gt 0 ]; then
+          printf 'Unexpected argument: %s\n' "$1" >&2
+          exit 2
+        fi
+        update_pane_personas "$kit" "$target" "$mode" "$personas_blob"
+        ;;
+      clear)
+        kit=${1:-}
+        [ -n "$kit" ] || { echo "Kit name required" >&2; exit 2; }
+        shift
+        target=${1:-}
+        [ -n "$target" ] || { echo "Pane target required (window:pane)" >&2; exit 2; }
+        shift
+        if [ $# -gt 0 ]; then
+          printf 'Unexpected argument: %s\n' "$1" >&2
+          exit 2
+        fi
+        update_pane_personas "$kit" "$target" "clear" ""
+        ;;
+      *)
+        usage >&2
+        exit 2
+        ;;
+    esac
+    ;;
+  *)
+    START_USE_DEFAULT_PERSONAS=1
+    START_EXTRA_PERSONAS=""
+    start_kit "$cmd"
+    ;;
+esac
